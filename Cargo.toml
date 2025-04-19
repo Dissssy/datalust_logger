@@ -1,0 +1,18 @@
+[package]
+name = "datalust_logger"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+log = { version = "*", features = ["std"] }
+anyhow = "1.0.98"
+reqwest = { version = "*", features = ["json", "blocking"] }
+chrono = { version = "*" }
+# tokio = { version = "*", features = ["full"], optional = true }
+# async-log = { version = "*", optional = true }
+serde_json = { version = "*" }
+nanoid = "*"
+
+[features]
+# default = ["async"]
+# async = ["tokio", "async-log"]
