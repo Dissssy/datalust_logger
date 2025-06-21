@@ -1,11 +1,16 @@
 use anyhow::Result;
 
-pub(crate) fn parse_info(
-    record: &log::Record,
-    source: &str,
-) -> Result<serde_json::Value> {
-    if record.module_path().map(|s| s.contains("datalust_logger")).unwrap_or(false) {
-        return Err(anyhow::anyhow!("Skipping log record from datalust_logger module"));
+pub(crate) fn parse_info(record: &log::Record, source: &str) -> Result<Option<serde_json::Value>> {
+    if record
+        .module_path()
+        .map(|s| s.contains("datalust_logger"))
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let msg = record.args().to_string();
+    if msg.contains("idle connection for") {
+        return Ok(None);
     }
     let now = chrono::Utc::now().to_rfc3339();
     let level = record.level();
@@ -14,7 +19,7 @@ pub(crate) fn parse_info(
         "@l": level.to_string(),
         "@mt": "[{source}::{target} | {level}] {msg}",
         "level": level.to_string(),
-        "msg": record.args().to_string(),
+        "msg": msg,
         "source": source,
         "thread": std::thread::current().name().unwrap_or("main"),
         "target": record.target(),
@@ -35,7 +40,7 @@ pub(crate) fn parse_info(
         level,
         record.args()
     );
-    Ok(log_entry)
+    Ok(Some(log_entry))
 }
 
 pub(crate) fn get_log_level() -> log::Level {
@@ -58,20 +63,14 @@ pub(crate) fn get_log_level() -> log::Level {
                 _ => log::Level::Info,
             },
             Err(_) => log::Level::Info,
-        }
+        },
     }
 }
 
 pub(crate) fn get_api_url() -> Option<String> {
-    match std::env::var("SEQ_API_URL") {
-        Ok(url) => Some(url),
-        Err(_) => None,
-    }
+    std::env::var("SEQ_API_URL").ok()
 }
 
 pub(crate) fn get_api_key() -> Option<String> {
-    match std::env::var("SEQ_API_KEY") {
-        Ok(key) => Some(key),
-        Err(_) => None,
-    }
+    std::env::var("SEQ_API_KEY").ok()
 }

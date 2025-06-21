@@ -1,7 +1,7 @@
 #![allow(static_mut_refs)]
-use std::mem::MaybeUninit;
-use log::{Record, Level, Metadata};
 use anyhow::Result;
+use log::{Level, Metadata, Record};
+use std::mem::MaybeUninit;
 use std::sync::mpsc::{channel, Sender};
 
 // pub fn init_local(
@@ -21,18 +21,18 @@ use std::sync::mpsc::{channel, Sender};
 //     init(source, Some(url), api_key, log_level)
 // }
 
-#[macro_export]
-macro_rules! set_panic_handler {
-    ($source:expr) => {
-        std::panic::set_hook(Box::new(move |info| {
-            let msg = match info.payload().downcast_ref::<&str>() {
-                Some(s) => s.to_string(),
-                None => format!("{:?}", info),
-            };
-            log::error!("{}", msg);
-        }));
-    };
-}
+// #[macro_export]
+// macro_rules! set_panic_handler {
+//     ($source:expr) => {
+//         std::panic::set_hook(Box::new(move |info| {
+//             let msg = match info.payload().downcast_ref::<&str>() {
+//                 Some(s) => s.to_string(),
+//                 None => format!("{:?}", info),
+//             };
+//             log::error!("{}", msg);
+//         }));
+//     };
+// }
 
 pub fn init(
     source: &str,
@@ -60,7 +60,7 @@ enum MessageOrExit {
 
 struct SeqLogger {
     source: String,
-    _thread: std::thread::JoinHandle<()>,
+    _thread: std::thread::JoinHandle<Result<()>>,
     send: Sender<MessageOrExit>,
     log_level: Level,
 }
@@ -75,18 +75,13 @@ struct StaticSender {
 impl StaticSender {
     fn write(&self, msg: serde_json::Value) {
         if let Err(e) = self.sender.send(MessageOrExit::Message(msg)) {
-            eprintln!("Failed to send log message: {}", e);
+            eprintln!("Failed to send log message: {e}");
         }
     }
 }
 
 impl SeqLogger {
-    fn new(
-        source: &str,
-        url: Option<&str>,
-        api_key: &str,
-        log_level: Level,
-    ) -> Result<Self> {
+    fn new(source: &str, url: Option<&str>, api_key: &str, log_level: Level) -> Result<Self> {
         let mut url = match url {
             Some(u) => u.to_string(),
             None => "http://localhost:5341".to_string(),
@@ -96,23 +91,6 @@ impl SeqLogger {
             url.push_str("/ingest/clef");
         }
         let source = source.to_string();
-        let client = reqwest::blocking::Client::new();
-        if let Err(e) = post(
-            &client,
-            serde_json::json!({
-                "@t": chrono::Utc::now().to_rfc3339(),
-                "@l": "Info",
-                "@mt": "[{source}] {msg}",
-                "level": "Info",
-                "msg": "INITIALIZING LOGGER",
-                "source": source,
-                "thread": std::thread::current().name().unwrap_or("main"),
-            }),
-            &url,
-            &api_key
-        ) {
-            return Err(anyhow::anyhow!("Failed to initialize logger: {}", e));
-        }
         let (send, recv) = channel::<MessageOrExit>();
         // Store the sender in a static variable
         unsafe {
@@ -121,26 +99,48 @@ impl SeqLogger {
                 source: source.clone(),
             });
         }
-        let thread = std::thread::spawn(move || {
-            loop {
-                match recv.recv() {
-                    Ok(MessageOrExit::Message(info)) => {
-                        if let Err(e) = post(&client, info, &url, &api_key) {
-                            eprintln!("{}", e);
+        let thread = {
+            let source = source.clone();
+            std::thread::spawn(move || {
+                let client = reqwest::blocking::Client::new();
+                if let Err(e) = post(
+                    &client,
+                    serde_json::json!({
+                        "@t": chrono::Utc::now().to_rfc3339(),
+                        "@l": "Info",
+                        "@mt": "[{source}] {msg}",
+                        "level": "Info",
+                        "msg": "INITIALIZING LOGGER",
+                        "source": source,
+                        "thread": std::thread::current().name().unwrap_or("main"),
+                    }),
+                    &url,
+                    &api_key,
+                ) {
+                    return Err(anyhow::anyhow!("Failed to initialize logger: {}", e));
+                }
+
+                loop {
+                    match recv.recv() {
+                        Ok(MessageOrExit::Message(info)) => {
+                            if let Err(e) = post(&client, info, &url, &api_key) {
+                                eprintln!("{e}");
+                            }
+                        }
+                        Ok(MessageOrExit::Exit(sender)) => {
+                            sender.send(()).ok();
+                            eprintln!("Logger thread exiting");
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to receive log message: {e}");
+                            break;
                         }
                     }
-                    Ok(MessageOrExit::Exit(sender)) => {
-                        sender.send(()).ok();
-                        eprintln!("Logger thread exiting");
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to receive log message: {}", e);
-                        break;
-                    },
                 }
-            }
-        });
+                Ok(())
+            })
+        };
         Ok(SeqLogger {
             source,
             _thread: thread,
@@ -149,7 +149,6 @@ impl SeqLogger {
         })
     }
 }
-
 
 impl log::Log for SeqLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
@@ -160,13 +159,16 @@ impl log::Log for SeqLogger {
         if self.enabled(record.metadata()) {
             let val = crate::helpers::parse_info(record, &self.source);
             match val {
-                Ok(val) => {
+                Ok(Some(val)) => {
                     if let Err(e) = self.send.send(MessageOrExit::Message(val)) {
-                        eprintln!("Failed to send log: {}", e);
+                        eprintln!("Failed to send log: {e}");
                     }
                 }
+                Ok(None) => {
+                    // Silently ignore.
+                }
                 Err(e) => {
-                    eprintln!("Failed to parse log message: {}", e);
+                    eprintln!("Failed to parse log message: {e}");
                 }
             }
         }
@@ -176,26 +178,33 @@ impl log::Log for SeqLogger {
         let (sender, receiver) = channel();
         self.send.send(MessageOrExit::Exit(sender)).ok();
         if let Err(e) = receiver.recv() {
-            eprintln!("Failed to receive exit signal: {}", e);
+            eprintln!("Failed to receive exit signal: {e}");
         }
     }
 }
 
-fn post(client: &reqwest::blocking::Client, info: serde_json::Value, url: &str, api_key: &str) -> Result<()> {
+fn post(
+    client: &reqwest::blocking::Client,
+    info: serde_json::Value,
+    url: &str,
+    api_key: &str,
+) -> Result<()> {
     let client = client.clone();
     let url = url.to_string();
     let api_key = api_key.to_string();
-    let res = match client.post(url)
+    let res = match client
+        .post(url)
         .header("X-Seq-ApiKey", api_key)
         .header("Content-Type", "application/json")
         .json(&info)
-        .send() {
-            Ok(res) => res,
-            Err(e) => {
-                eprintln!("Failed to send log: {}", e);
-                return Err(anyhow::anyhow!("Failed to send log: {}", e));
-            }
-        };
+        .send()
+    {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Failed to send log: {e}");
+            return Err(anyhow::anyhow!("Failed to send log: {e}"));
+        }
+    };
     if res.status().is_success() {
         Ok(())
     } else {
@@ -230,8 +239,8 @@ pub mod rich_anyhow_logging {
 
     pub fn with_level(level: log::Level, err: &anyhow::Error) {
         let sender = super::get_static_sender();
-        let trace = format!("{:?}", err);
-        let msg = format!("{}", err);
+        let trace = format!("{err:?}");
+        let msg = format!("{err}");
         let val = serde_json::json!({
             "@t": chrono::Utc::now().to_rfc3339(),
             "@l": level.to_string(),
